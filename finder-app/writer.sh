@@ -13,7 +13,7 @@ fi
 writefile=$1
 writestr=$2
 
-# Check if the argumentos are not empty
+# Check if the arguments are not empty
 if [ -z ${writefile} ] || [ -z ${writestr} ]; then
   echo "Usage: $0 <writefile> <writestr>"
   exit 1

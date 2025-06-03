@@ -13,7 +13,7 @@ fi
 filesdir=$1
 searchstr=$2
 
-# Check if the argumentos are not empty
+# Check if the arguments are not empty
 if [ -z ${filesdir} ] || [ -z ${searchstr} ]; then
     echo "Usage: $0 <directory> <search_string>"
     exit 1
