@@ -1,4 +1,9 @@
 #include "systemcalls.h"
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <stdio.h>
+#include <fcntl.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -17,7 +22,26 @@ bool do_system(const char *cmd)
  *   or false() if it returned a failure
 */
 
-    return true;
+    bool retval = false;
+
+    int status = system(cmd);
+    if (-1 == status) {
+        // system failed to execute the command
+        perror("Error executing command with system()");
+    }
+    else if (0 == status)
+    {
+        // The command was executed successfully
+        printf("Command '%s' executed successfully\n", cmd);
+        retval = true;
+    }
+    else
+    {
+        // The command returned a non-zero exit status
+        fprintf(stderr, "Command '%s' failed with status %d\n", cmd, status);
+    }
+
+    return retval;
 }
 
 /**
@@ -47,7 +71,7 @@ bool do_exec(int count, ...)
     command[count] = NULL;
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    // command[count] = command[count];
 
 /*
  * TODO:
@@ -58,10 +82,53 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    bool retval = false;
+
+    if (count < 1 || command[0] == NULL)
+    {
+        perror("Invalid arguments");
+        va_end(args);
+        return retval;
+    }
+
+    // Flush the stdout
+    fflush(stdout);
+
+    pid_t pid = fork();
+    if (0 == pid)
+    {
+        // Child process
+        execv(command[0], command);
+
+        // If execv fails this line will be executed
+        perror("execv failed");
+        _exit(EXIT_FAILURE);
+    }
+    else if (-1 == pid)
+    {
+        // fork failed
+        perror("fork failed\n");
+    }
+    else
+    {
+        // Parent process
+        int status = 0;
+        pid_t wait_pid = waitpid(pid, &status, 0);
+        if (wait_pid == -1)
+        {
+            // waitpid failed
+            perror("Error waiting for child process\n");
+        }
+        else if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        {
+            retval = true; // Command executed successfully
+            printf("Command '%s' executed successfully\n", command[0]);
+        }
+    }
 
     va_end(args);
 
-    return true;
+    return retval;
 }
 
 /**
@@ -82,7 +149,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     command[count] = NULL;
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    // command[count] = command[count];
 
 
 /*
@@ -92,6 +159,70 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+
+    bool retval = false;
+
+    if (count < 1 || command[0] == NULL || outputfile == NULL)
+    {
+        perror("Invalid arguments");
+        va_end(args);
+        return retval;
+    }
+
+    int fd = open(outputfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (-1 == fd)
+    {
+        perror("Error opening output file for redirection");
+        return retval;
+    }
+
+    // Flush the stdout
+    fflush(stdout);
+
+    pid_t pid = fork();
+    if (0 == pid)
+    {
+        int status = dup2(fd, STDOUT_FILENO);
+        if (status == -1)
+        {
+            perror("Error redirecting stdout to file");
+            close(fd);
+            _exit(EXIT_FAILURE);
+        }
+
+        close(fd); // Close the file descriptor after duplicating it
+
+        // Child process
+        execv(command[0], command);
+
+        // If execv fails this line will be executed
+        perror("execv failed");
+        _exit(EXIT_FAILURE);
+    }
+    else if (-1 == pid)
+    {
+        // fork failed
+        perror("fork failed\n");
+        close(fd);
+    }
+    else
+    {
+        close(fd); // Close the file descriptor in the parent process
+
+        // Parent process
+        int status = 0;
+        pid_t wait_pid = waitpid(pid, &status, 0);
+        if (wait_pid == -1)
+        {
+            // waitpid failed
+            perror("Error waiting for child process\n");
+        }
+        else if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        {
+            retval = true; // Command executed successfully
+            printf("Command '%s' executed successfully\n", command[0]);
+        }
+    }
 
     va_end(args);
 

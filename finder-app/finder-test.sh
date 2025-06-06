@@ -49,11 +49,11 @@ then
 	fi
 fi
 
-echo "Removing the old writer utility and compiling as a native application"
-make clean
+# echo "Removing the old writer utility and compiling as a native application"
+# make clean
 
 # Compile the writer application natively
-make
+# make
 
 for i in $( seq 1 $NUMFILES)
 do
