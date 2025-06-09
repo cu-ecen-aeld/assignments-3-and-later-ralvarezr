@@ -14,6 +14,33 @@ struct thread_data{
      * between the start_thread_obtaining_mutex function and
      * your thread implementation.
      */
+    /**
+     * The pointer to the mutex to obtain and release.
+     * This should be set by the start_thread_obtaining_mutex
+     * function and used by the thread implementation.
+     */
+    pthread_mutex_t *mutex;
+
+    /**
+     * The number of milliseconds to wait before obtaining the mutex.
+     * This should be set by the start_thread_obtaining_mutex
+     * function and used by the thread implementation.
+     */
+    int wait_to_obtain_ms;
+
+    /**
+     * The number of milliseconds to hold the mutex before releasing it.
+     * This should be set by the start_thread_obtaining_mutex
+     * function and used by the thread implementation.
+     */
+    int wait_to_release_ms;
+
+    /**
+     * The thread ID of the thread that is created.
+     * This should be set by the start_thread_obtaining_mutex
+     * function and used by the thread implementation.
+     */
+    pthread_t thread_id;
 
     /**
      * Set to true if the thread completed with success, false
