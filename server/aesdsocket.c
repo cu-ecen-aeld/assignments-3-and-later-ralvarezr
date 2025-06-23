@@ -12,6 +12,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <stdbool.h>
 
 #define PORT "9000"
 #define BACKLOG 10
@@ -50,7 +51,7 @@ static void signal_handler(int signal_number)
 
     if (SIGINT == signal_number || SIGTERM == signal_number)
     {
-        // cleanup();
+        cleanup();
         exit(0);
     }
 }
@@ -75,9 +76,16 @@ int main(int argc, char *argv[])
     ssize_t bytes_received;                             // Number of bytes received from client
     struct sigaction new_action;                        // Structure for signal handling
     FILE *fd;                                           // File descriptor pointer for writing to the file
+    bool daemon_mode = false;                           // Flag for daemon mode
+
+    // Parse -d argument
+    if ((argc == 2) && (0 == strcmp(argv[1], "-d")))
+    {
+        daemon_mode = true;
+    }
 
     // Open the syslog for logging
-    openlog("aesdsocket", LOG_PID | LOG_PERROR, LOG_USER);  //*********************** REMOVE LOG_PERROR */
+    openlog("aesdsocket", 0, LOG_USER);
 
     // Initialize signal handling
     memset(&new_action, 0, sizeof(new_action));
@@ -147,6 +155,38 @@ int main(int argc, char *argv[])
     // Free the address information
     freeaddrinfo(res);
 
+    // Daemonize if requested
+    if (daemon_mode)
+    {
+        pid_t pid = fork();
+        if (pid < 0)
+        {
+            syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
+            cleanup();
+            return -1;
+        }
+        if (pid > 0)
+        {
+            // Parent exits
+            exit(0);
+        }
+
+        // Child becomes session leader
+        if (setsid() < 0)
+        {
+            syslog(LOG_ERR, "setsid failed: %s", strerror(errno));
+            cleanup();
+            return -1;
+        }
+
+        // Close standard file descriptors
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+    }
+
+    syslog(LOG_INFO, "Server daemonized successfully");
+
     // Listen for incoming connections
     if (-1 == listen(server_fd, BACKLOG))
     {
@@ -182,13 +222,13 @@ int main(int argc, char *argv[])
         }
 
         char *packet = NULL;
-        size_t total_received = 0;
+        size_t packet_size = 0;
 
         while (0 < (bytes_received = recv(client_fd, buffer, BUFFER_SIZE, 0)))
         {
 
-            char *temp = realloc(packet, total_received + bytes_received + 1);
-            if (!temp)
+            char *new_packet = realloc(packet, packet_size + bytes_received + 1);
+            if (!new_packet)
             {
                 syslog(LOG_ERR, "Memory allocation failed");
                 free(packet);
@@ -199,25 +239,23 @@ int main(int argc, char *argv[])
             }
 
             // Update packet pointer to the newly allocated memory
-            packet = temp;
+            packet = new_packet;
 
             // Copy the received data into the packet
-            memcpy(packet + total_received, buffer, bytes_received);
-            total_received += bytes_received;
-            packet[total_received] = '\0';
+            memcpy(packet + packet_size, buffer, bytes_received);
+            packet_size += bytes_received;
+            packet[packet_size] = '\0';
 
             // Check if the packet contains a newline character
-            if (memchr(buffer, '\n', bytes_received))
+            if (memchr(packet, '\n', packet_size))
                 break;
         }
 
-        syslog(LOG_INFO, "Total bytes received: %zu", total_received);
+        syslog(LOG_INFO, "Total bytes received: %zu", packet_size);
         // If data was received, write it to the file
-        if (packet)
+        if (NULL != packet && packet_size > 0)
         {
-            syslog(LOG_INFO, "Received data: %s\n", packet);  // DELETE********************
-
-            fwrite(packet, 1, total_received, fd);
+            fwrite(packet, 1, packet_size, fd);
             fflush(fd);
             free(packet);
         }
@@ -229,7 +267,6 @@ int main(int argc, char *argv[])
         syslog(LOG_INFO, "Sending file contents to client");
         while (0 < (bytes_received = fread(buffer, 1, BUFFER_SIZE, fd)))
         {
-            syslog(LOG_INFO, "Buffer content: %.*s\n", (int)bytes_received, buffer);  // DELETE********************
             send(client_fd, buffer, bytes_received, 0);
         }
 
