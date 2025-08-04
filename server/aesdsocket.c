@@ -201,6 +201,7 @@ int main(int argc, char *argv[])
     {
         syslog(LOG_INFO, "Server is running, waiting for connections...");
 
+        // Accept incoming connections
         client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
         if (-1 == client_fd)
         {
@@ -208,11 +209,13 @@ int main(int argc, char *argv[])
             continue;
         }
 
+        // Get the client IP address
         inet_ntop(client_addr.ss_family, get_in_addr((struct sockaddr *)&client_addr),
                   client_ip, sizeof(client_ip));
 
         syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
+        // Open the file for writing
         fd = fopen(FILEPATH, "a+");
         if (!fd)
         {
@@ -221,12 +224,15 @@ int main(int argc, char *argv[])
             continue;
         }
 
+        // Initialize the buffer for receiving data
         char *packet = NULL;
         size_t packet_size = 0;
 
+        // Receive data from the client
         while (0 < (bytes_received = recv(client_fd, buffer, BUFFER_SIZE, 0)))
         {
 
+            // Reallocate memory for the packet to hold the new data
             char *new_packet = realloc(packet, packet_size + bytes_received + 1);
             if (!new_packet)
             {
@@ -270,6 +276,7 @@ int main(int argc, char *argv[])
             send(client_fd, buffer, bytes_received, 0);
         }
 
+        // Close the file descriptor
         fclose(fd);
 
         syslog(LOG_INFO, "Closed connection from %s", client_ip);
