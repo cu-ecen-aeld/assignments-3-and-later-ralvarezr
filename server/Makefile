@@ -1,7 +1,8 @@
-#Makefile for assignment 5
+#Makefile for assignment 6
 
 CC = $(CROSS_COMPILE)gcc
 CFLAGS=-Wall -Werror -g
+LDFLAGS=-lpthread
 
 # Source files
 SRC = aesdsocket.c
@@ -13,7 +14,7 @@ all: $(TARGET)
 
 # Build app
 $(TARGET): $(OBJ)
-	$(CC) ${CFLAGS} -o $@ $^
+	$(CC) ${CFLAGS} -o $@ $^ $(LDFLAGS)
 
 # Compile .c files to .o files
 %.o: %.c
