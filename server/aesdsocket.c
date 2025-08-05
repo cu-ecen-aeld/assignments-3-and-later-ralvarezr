@@ -46,6 +46,7 @@ struct thread_list thread_head = SLIST_HEAD_INITIALIZER(thread_head);
  * @param sig The signal number.
  */
 static void handle_signal(int sig) {
+    (void)sig;
     printf("Caught signal, exiting\n");
     if (server_socket != -1) close(server_socket);
     // The client_socket global variable is not used correctly in a multithreaded context.
@@ -94,6 +95,7 @@ static void daemonize(void) {
  * @return void* Always returns NULL.
  */
 void* timestamp_writer(void* arg) {
+    (void)arg;
     while(!exit_requested) {
         sleep(10); // Wait for 10 seconds
         pthread_mutex_lock(&file_mutex);
@@ -103,7 +105,10 @@ void* timestamp_writer(void* arg) {
             struct tm *tm_info = localtime(&now);
             char timebuf[100];
             strftime(timebuf, sizeof(timebuf), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tm_info);
-            write(file_fd, timebuf, strlen(timebuf));
+            if (-1 == write(file_fd, timebuf, strlen(timebuf)))
+	    {
+		perror("write");
+	    }
             close(file_fd);
         }
         pthread_mutex_unlock(&file_mutex);
@@ -139,7 +144,10 @@ void* connection_handler(void* arg) {
         pthread_mutex_lock(&file_mutex);
         int file_fd = open(FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
         if (file_fd >= 0) {
-            write(file_fd, buffer, bytes_received);
+            if (-1 == write(file_fd, buffer, bytes_received))
+	    {
+		perror("write");
+	    }
             close(file_fd);
         }
         pthread_mutex_unlock(&file_mutex);

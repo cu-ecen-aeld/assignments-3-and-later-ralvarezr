@@ -1,7 +1,7 @@
 #Makefile for assignment 6
 
 CC ?= $(CROSS_COMPILE)gcc
-CFLAGS += -Wall -Werror -g
+CFLAGS += -Wall -Werror -Wextra -g
 LDFLAGS += -lpthread
 
 SRC = aesdsocket.c
