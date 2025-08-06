@@ -32,6 +32,34 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
     /**
     * TODO: implement per description
     */
+    size_t total_size = 0;
+    int i = 0;
+    int current_index = buffer->out_offs;
+
+    // Check if the buffer is valid
+    if (buffer == NULL || entry_offset_byte_rtn == NULL) {
+        return NULL;
+    }
+
+    // Iterate through the buffer to find the entry and offset
+    for (i = 0; i < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; i++) {
+        // Handle the circular nature of the buffer
+        current_index = (buffer->out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+
+        // If the buffer is not full, stop when we reach the in_offs
+        if (!buffer->full && current_index == buffer->in_offs && i > 0) {
+            break;
+        }
+
+        // Check if the char_offset falls within the current entry
+        if (char_offset < total_size + buffer->entry[current_index].size) {
+            *entry_offset_byte_rtn = char_offset - total_size;
+            return &buffer->entry[current_index];
+        }
+
+        // Add the current entry's size to the total size
+        total_size += buffer->entry[current_index].size;
+    }
     return NULL;
 }
 
@@ -47,6 +75,29 @@ void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const s
     /**
     * TODO: implement per description
     */
+
+    // Check for null pointers
+    if (buffer == NULL || add_entry == NULL) {
+        return;
+    }
+
+    // If the buffer is full, advance out_offs
+    if (buffer->full) {
+        buffer->out_offs = (buffer->out_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    }
+
+    // Copy the new entry into the buffer
+    buffer->entry[buffer->in_offs] = *add_entry;
+
+    // Advance in_offs
+    buffer->in_offs = (buffer->in_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+
+    // Check if the buffer is now full
+    if (buffer->in_offs == buffer->out_offs) {
+        buffer->full = true;
+    } else {
+        buffer->full = false;
+    }
 }
 
 /**
