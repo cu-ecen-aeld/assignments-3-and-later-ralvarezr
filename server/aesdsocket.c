@@ -1,293 +1,473 @@
-#include <stdio.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <signal.h>
 #include <fcntl.h>
-#include <sys/stat.h>
+#include <syslog.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <pthread.h>
-#include <time.h>
-#include <sys/time.h>
-#include <sys/queue.h>
 
-// Define constants for the server configuration
-#define PORT "9000"
-#define BUFFER_SIZE 1024
-#define FILE_PATH "/var/tmp/aesdsocketdata"
+#define USE_AESD_CHAR_DEVICE 1
 
-// Global variables for socket file descriptors and a flag for graceful shutdown
-int server_socket = -1;
-int client_socket = -1; // This is a temporary variable within the main loop. It's better to manage it per thread.
-volatile sig_atomic_t exit_requested = 0;
+#define RETRY_ON_INTERRUPT(expression)                  \
+({                                                      \
+    int RETRY_ON_INTERRUPT_result = 0;                  \
+    while (true)                                        \
+    {                                                   \
+        RETRY_ON_INTERRUPT_result = (expression);   \
+        if (RETRY_ON_INTERRUPT_result == -1)            \
+        {                                               \
+            if (errno == EINTR)                         \
+                continue;                               \
+            else                                        \
+                break;                                  \
+        }                                               \
+        else                                            \
+        {                                               \
+            break;                                      \
+        }                                               \
+    }                                                   \
+    RETRY_ON_INTERRUPT_result;                          \
+})
 
-// Mutex for synchronizing file access between threads
-pthread_mutex_t file_mutex;
-
-// Structure to hold information about each thread
-struct thread_info {
-    pthread_t thread_id;        // The ID of the thread
-    int client_socket;          // The socket file descriptor for the client
-    SLIST_ENTRY(thread_info) entries; // Macro for the singly linked list
+struct Client
+{
+    int socket;
+    struct sockaddr_in address;
+    pthread_t threadId;
+    size_t lineBufferCursor;
+    size_t lineBufferSize;
+    char* lineBuffer;
+    struct Client* next;
 };
 
-// Head of the singly linked list to track active threads
-SLIST_HEAD(thread_list, thread_info);
-struct thread_list thread_head = SLIST_HEAD_INITIALIZER(thread_head);
+static bool g_exitProgram = false;
+static int g_serverSocket = -1;
+static struct Client* g_clientListHead;
+static pthread_mutex_t g_clientListMutex;
+static pthread_mutex_t g_outputFileMutex;
+static struct sigaction g_oldSigtermHandler;
+static struct sigaction g_oldSigintHandler;
+const size_t g_lineBufferStartSize = 64;
 
-/**
- * @brief Signal handler for SIGINT and SIGTERM.
- *
- * This function handles signals to perform a clean exit. It closes the sockets,
- * removes the data file, and exits the program.
- * @param sig The signal number.
- */
-static void handle_signal(int sig) {
-    (void)sig;
-    printf("Caught signal, exiting\n");
-    if (server_socket != -1) close(server_socket);
-    // The client_socket global variable is not used correctly in a multithreaded context.
-    // It's better to close the socket within the thread handler.
-    if (client_socket != -1) close(client_socket);
-    remove(FILE_PATH);
-    exit(0);
-}
+#if USE_AESD_CHAR_DEVICE == 1
+    static const char* g_outputFilePath = "/dev/aesdchar";
+#else
+    static const char* g_outputFilePath = "/var/tmp/aesdsocketdata";
+#endif
 
-/**
- * @brief Converts the process into a daemon.
- *
- * This function forks the process, exits the parent, creates a new session,
- * changes the working directory to root, and closes standard file descriptors
- * (stdin, stdout, stderr).
- */
-static void daemonize(void) {
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("Fork failed");
-        exit(EXIT_FAILURE);
-    }
-    if (pid > 0) {
-        exit(EXIT_SUCCESS); // Exit the parent process
-    }
-    umask(0); // Set file mode creation mask to 0
-    if (setsid() < 0) {
-        perror("Failed to create new session");
-        exit(EXIT_FAILURE);
-    }
-    if (chdir("/") < 0) {
-        perror("Failed to change directory to root");
-        exit(EXIT_FAILURE);
-    }
-    close(STDIN_FILENO);
-    close(STDOUT_FILENO);
-    close(STDERR_FILENO);
-}
+void TearDownClient(struct Client* client)
+{
+    syslog(LOG_INFO, "Terminating client... Client Id: %ld.", client->threadId);
 
-/**
- * @brief Thread function to write a timestamp to the log file every 10 seconds.
- *
- * It acquires a mutex before writing to ensure thread-safe file access.
- * The loop continues until the `exit_requested` flag is set.
- * @param arg Not used.
- * @return void* Always returns NULL.
- */
-void* timestamp_writer(void* arg) {
-    (void)arg;
-    while(!exit_requested) {
-        sleep(10); // Wait for 10 seconds
-        pthread_mutex_lock(&file_mutex);
-        int file_fd = open(FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
-        if (file_fd >= 0) {
-            time_t now = time(NULL);
-            struct tm *tm_info = localtime(&now);
-            char timebuf[100];
-            strftime(timebuf, sizeof(timebuf), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tm_info);
-            if (-1 == write(file_fd, timebuf, strlen(timebuf)))
-	    {
-		perror("write");
-	    }
-            close(file_fd);
+    close(client->socket);
+
+    if (client->lineBuffer != NULL)
+    {
+        free(client->lineBuffer);
+        client->lineBuffer = NULL;
+    }
+
+    pthread_mutex_lock(&g_clientListMutex);
+    if (g_clientListHead == client)
+    {
+        g_clientListHead = client->next;
+    }
+    else
+    {
+        struct Client* currentClient = g_clientListHead;
+        while (currentClient != NULL)
+        {
+            if (currentClient->next == client)
+            {
+                currentClient->next = client->next;
+                break;
+            }
+            currentClient = currentClient->next;
         }
-        pthread_mutex_unlock(&file_mutex);
+    }
+    pthread_mutex_unlock(&g_clientListMutex);
+    free(client);
+}
+
+void TearDownServer(int exitCode)
+{
+    syslog(LOG_INFO, "Terminating server...");
+
+    g_exitProgram = true;
+
+    pthread_mutex_lock(&g_clientListMutex);
+    struct Client* currentClient = g_clientListHead;
+    while (currentClient != NULL)
+    {
+        pthread_t threadId = g_clientListHead->threadId;
+        pthread_mutex_unlock(&g_clientListMutex);
+
+        pthread_join(threadId, NULL);
+
+        pthread_mutex_lock(&g_clientListMutex);
+        currentClient = g_clientListHead;
+    }
+    pthread_mutex_unlock(&g_clientListMutex);
+
+    g_clientListHead = NULL;
+
+    #if USE_AESD_CHAR_DEVICE != 1
+        remove(g_outputFilePath);
+    #endif
+
+    if (g_serverSocket != -1)
+    {
+        close(g_serverSocket);
+        g_serverSocket = -1;
     }
 
-    printf("Timestamp writer thread exiting\n");
+    if (g_exitProgram)
+        syslog(LOG_ERR, "Caught signal exiting");
+
+    closelog();
+
+    sigaction(SIGTERM, &g_oldSigtermHandler, NULL);
+    sigaction(SIGTERM, &g_oldSigintHandler, NULL);
+
+    syslog(LOG_INFO, "Exiting process...");
+
+    exit(exitCode);
+}
+
+bool ProcessPackage(struct Client* client)
+{
+    pthread_mutex_lock(&g_outputFileMutex);
+
+    int outputFile = open(g_outputFilePath, O_RDWR | O_CREAT, 0666);
+    if (outputFile == -1)
+    {
+        syslog(LOG_ERR, "Cannot open file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+        TearDownServer(EXIT_FAILURE);
+    }
+
+    if (RETRY_ON_INTERRUPT(write(outputFile, client->lineBuffer, client->lineBufferCursor)) == -1)
+    {
+        pthread_mutex_unlock(&g_outputFileMutex);
+
+        syslog(LOG_ERR, "Cannot write to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+        TearDownClient(client);
+        return false;
+    }
+
+    while (true)
+    {
+        char fileBuffer[512];
+        int readBytes = RETRY_ON_INTERRUPT(read(outputFile, fileBuffer, sizeof(fileBuffer)));
+        if (readBytes == -1)
+        {
+            close(outputFile);
+            pthread_mutex_unlock(&g_outputFileMutex);
+
+            syslog(LOG_ERR, "Cannot read from file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+            TearDownClient(client);
+            return false;
+        }
+        else if (readBytes == 0)
+        {
+            break;
+        }
+
+        int sendResult = RETRY_ON_INTERRUPT(send(client->socket, fileBuffer, readBytes, 0));
+        if (sendResult == -1)
+        {
+            close(outputFile);
+            pthread_mutex_unlock(&g_outputFileMutex);
+
+            syslog(LOG_ERR, "Cannot send bytes to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+            TearDownClient(client);
+            return false;
+        }
+    }
+    close(outputFile);
+    pthread_mutex_unlock(&g_outputFileMutex);
+
+    client->lineBufferCursor = 0;
+
+    return true;
+}
+
+bool ParsePackage(struct Client* client, const char* recvBuffer, size_t recvBytes)
+{
+    for (size_t i = 0; i < recvBytes; i++)
+    {
+        // Exponential Line Buffer Heap Allocation
+        if (client->lineBufferCursor + 1 > client->lineBufferSize)
+        {
+            if (client->lineBuffer == NULL)
+            {
+                client->lineBufferSize = g_lineBufferStartSize;
+                client->lineBuffer = malloc(client->lineBufferSize);
+                if (client->lineBuffer == NULL)
+                {
+                    syslog(LOG_ERR, "Cannot allocate line buffer memory.");
+                    TearDownClient(client);
+                    return false;
+                }
+            }
+            else
+            {
+                client->lineBufferSize *= 2;
+                client->lineBuffer = realloc(client->lineBuffer, client->lineBufferSize);
+                if (client->lineBuffer == NULL)
+                {
+                    syslog(LOG_ERR, "Cannot reallocate line buffer memory.");
+                    TearDownClient(client);
+                    return false;
+                }
+            }
+        }
+
+        client->lineBuffer[client->lineBufferCursor] = recvBuffer[i];
+        client->lineBufferCursor++;
+
+        if (recvBuffer[i] == '\n')
+        {
+            if (!ProcessPackage(client))
+                return false;
+        }
+    }
+
+    return true;
+}
+
+void* ClientLoop(void* argument)
+{
+    pthread_mutex_lock(&g_clientListMutex);
+    struct Client* client = (struct Client*)argument;
+    client->threadId = pthread_self();
+    if (g_clientListHead == NULL)
+    {
+        g_clientListHead = client;
+    }
+    else
+    {
+        struct Client* currentClient = g_clientListHead;
+        while (currentClient->next != NULL)
+            currentClient = currentClient->next;
+        currentClient->next = client;
+    }
+    pthread_mutex_unlock(&g_clientListMutex);
+
+    while (!g_exitProgram)
+    {
+        char recvBuffer[512];
+        int recvBytes = RETRY_ON_INTERRUPT(recv(client->socket, recvBuffer, sizeof(recvBuffer), 0));
+        if (recvBytes == 0)
+        {
+            syslog(LOG_INFO, "Closed connection from %d.%d.%d.%d",
+                (int)((uint8_t*)&client->address.sin_addr)[3],
+                (int)((uint8_t*)&client->address.sin_addr)[2],
+                (int)((uint8_t*)&client->address.sin_addr)[1],
+                (int)((uint8_t*)&client->address.sin_addr)[0]
+            );
+            TearDownClient(client);
+            return NULL;
+        }
+        else if (recvBytes == -1)
+        {
+            syslog(LOG_ERR, "Socket recv error. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
+            TearDownClient(client);
+            return NULL;
+        }
+
+        if (!ParsePackage(client, recvBuffer, recvBytes))
+            return NULL;
+    }
+
+    TearDownClient(client);
     return NULL;
 }
 
-/**
- * @brief Thread function to handle a single client connection.
- *
- * This function receives data from a client, writes it to the data file,
- * and then reads the entire file content to send it back to the client.
- * All file operations are protected by a mutex.
- * @param arg A pointer to the thread_info structure containing client socket data.
- * @return void* Always returns NULL.
- */
-void* connection_handler(void* arg) {
-
-    struct thread_info *tinfo = (struct thread_info*) arg;
-    int client_socket = tinfo->client_socket;
-    ssize_t bytes_received;
-    char buffer[BUFFER_SIZE];
-
-    printf("Accepted connection\n");
-
-    // Receive data from the client until a newline character is found
-    while ((bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0)) > 0) {
-        buffer[bytes_received] = '\0';
-
-        // Lock the mutex for thread-safe file writing
-        pthread_mutex_lock(&file_mutex);
-        int file_fd = open(FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
-        if (file_fd >= 0) {
-            if (-1 == write(file_fd, buffer, bytes_received))
-	    {
-		perror("write");
-	    }
-            close(file_fd);
-        }
-        pthread_mutex_unlock(&file_mutex);
-
-        if (strchr(buffer, '\n')) break;
-    }
-
-    // Lock the mutex for thread-safe file reading
-    pthread_mutex_lock(&file_mutex);
-    int file_fd = open(FILE_PATH, O_RDONLY);
-    if (file_fd >= 0) {
-        // Read the entire file content and send it back to the client
-        while ((bytes_received = read(file_fd, buffer, BUFFER_SIZE)) > 0) {
-            send(client_socket, buffer, bytes_received, 0);
-        }
-        close(file_fd);
-    }
-    pthread_mutex_unlock(&file_mutex);
-
-    close(client_socket);
-    printf("Closed connection");
-    return NULL;
+void SignalHandler()
+{
+    g_exitProgram = true;
 }
 
-/**
- * @brief Main function of the aesdsocket server.
- *
- * It initializes the server, handles command-line arguments for daemon mode,
- * sets up signal handlers, creates the main listening socket, and enters
- * a loop to accept client connections and spawn threads to handle them.
- * It also manages the lifecycle of these threads by joining them at the end.
- * @param argc The number of command-line arguments.
- * @param argv An array of command-line argument strings.
- * @return int The exit status of the program.
- */
-int main(int argc, char *argv[]) {
-    struct addrinfo hints, *res;
-    int daemon_mode = 0;
-    int optval = 1;
+void InitializeServer()
+{
+    syslog(LOG_INFO, "Initializing...");
 
-    // Initialize the mutex
-    pthread_mutex_init(&file_mutex, NULL);
+    openlog(NULL, LOG_PID, LOG_USER);
+    syslog(LOG_INFO, "Started");
 
-    // Check for the daemon mode command-line argument
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-d") == 0) {
-            daemon_mode = 1;
+    struct sigaction signalAction;
+    memset(&signalAction, 0, sizeof(signalAction));
+    signalAction.sa_handler = SignalHandler;
+
+    if (sigaction(SIGTERM, &signalAction, &g_oldSigtermHandler) != 0)
+    {
+        syslog(LOG_ERR, "Cannot register signal handler.");
+        TearDownServer(EXIT_FAILURE);
+    }
+
+    if (sigaction(SIGINT, &signalAction, &g_oldSigintHandler) != 0)
+    {
+        syslog(LOG_ERR, "Cannot register signal handler.");
+        TearDownServer(EXIT_FAILURE);
+    }
+
+    g_serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_serverSocket == -1)
+    {
+        syslog(LOG_ERR, "Cannot create socket. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
+        TearDownServer(EXIT_FAILURE);
+    }
+
+    struct sockaddr_in serverAddress;
+    memset(&serverAddress, 0, sizeof(serverAddress));
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(9000);
+    serverAddress.sin_addr.s_addr = htonl(INADDR_ANY);
+    int bindResult = bind(g_serverSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress));
+    if (bindResult == -1)
+    {
+        syslog(LOG_ERR, "Cannot bind socket. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
+        TearDownServer(EXIT_FAILURE);
+    }
+}
+
+void ExecuteServer()
+{
+    int listenResult = listen(g_serverSocket, 10);
+    if (listenResult == -1)
+    {
+        syslog(LOG_ERR, "Cannot listen socket. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
+        TearDownServer(EXIT_FAILURE);
+    }
+
+    while (!g_exitProgram)
+    {
+        struct sockaddr_in clientAddress;
+        unsigned int clientAddressSize = sizeof(clientAddressSize);
+        memset(&clientAddress, 0, sizeof(clientAddress));
+        int clientSocket = accept(g_serverSocket, (struct sockaddr*)&clientAddress, &clientAddressSize);
+        if (clientSocket == -1)
+        {
+            if (errno == EINTR && g_exitProgram)
+                TearDownServer(EXIT_SUCCESS);
+
+            syslog(LOG_ERR, "Cannot accept socket. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
+            TearDownServer(EXIT_FAILURE);
+        }
+
+        struct Client* newClient = (struct Client*)malloc(sizeof(struct Client));
+        if (newClient == NULL)
+        {
+            syslog(LOG_ERR, "Cannot allocate thread memory.");
+            TearDownServer(EXIT_FAILURE);
+        }
+
+        memset(newClient, 0, sizeof(struct Client));
+        newClient->socket = clientSocket;
+        memcpy(&newClient->address, &clientAddress, sizeof(clientAddress));
+
+        pthread_t newThread;
+        if (pthread_create(&newThread, NULL, &ClientLoop, newClient) != 0)
+        {
+            syslog(LOG_ERR, "Cannot create client thread.");
+            free(newClient);
+            TearDownServer(EXIT_FAILURE);
+        }
+    }
+}
+
+void StartDaemon()
+{
+    syslog(LOG_INFO, "Forking daemon...");
+
+    fflush(stdout);
+    fflush(stderr);
+
+    int pid = fork();
+    if (pid == 0)
+    {
+        syslog(LOG_INFO, "Running as daemon...");
+
+        setsid();
+
+        if (chdir("/") == -1)
+        {
+            syslog(LOG_ERR, "Cannot change current working directory.");
+            TearDownServer(EXIT_FAILURE);
+        }
+
+        int nullFile = open("/dev/null", O_RDWR);
+        dup2(nullFile, STDIN_FILENO);
+        dup2(nullFile, STDOUT_FILENO);
+        dup2(nullFile, STDERR_FILENO);
+        close(nullFile);
+
+        ExecuteServer();
+        TearDownServer(EXIT_SUCCESS);
+    }
+    else
+    {
+        TearDownServer(EXIT_SUCCESS);
+    }
+}
+
+void StartApplication()
+{
+    syslog(LOG_INFO, "Running as application...");
+    ExecuteServer();
+    TearDownServer(EXIT_SUCCESS);
+}
+
+void PrintHelp()
+{
+    printf(
+        "aesdsocket - Simple Socket Utility\n"
+        "---------------------------------------\n"
+        "Usage: aesdsocket [-d]\n"
+        "\n"
+        "Arguments:\n"
+        "  -d   Run as daemon.\n"
+        "  -h   Display this help text.\n"
+    );
+}
+
+int main(int argc, char** argv)
+{
+    bool daemonMode = false;
+
+    int opt;
+    while ((opt = getopt(argc, argv, "dh")) != -1)
+    {
+        switch (opt)
+        {
+            case 'd':
+                daemonMode = true;
+                break;
+
+            case 'h':
+                PrintHelp();
+                exit(EXIT_SUCCESS);
+                break;
+
+            default:
+                PrintHelp();
+                exit(EXIT_FAILURE);
+                break;
         }
     }
 
-    // Set up signal handlers for graceful exit
-    signal(SIGINT, handle_signal);
-    signal(SIGTERM, handle_signal);
+    InitializeServer();
 
-    // Configure the address information for socket creation
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
+    if (daemonMode)
+        StartDaemon();
+    else
+        StartApplication();
 
-    if (getaddrinfo(NULL, PORT, &hints, &res) != 0) {
-        perror("getaddrinfo failed");
-        return -1;
-    }
-
-    // Create the server socket
-    if ((server_socket = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) == -1) {
-        perror("Failed to create socket");
-        freeaddrinfo(res);
-        return -1;
-    }
-
-    // Set socket options to reuse the address
-    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
-        perror("Failed to set socket options");
-        close(server_socket);
-        freeaddrinfo(res);
-        return -1;
-    }
-
-    // Bind the socket to the specified port
-    if (bind(server_socket, res->ai_addr, res->ai_addrlen) == -1) {
-        perror("Failed to bind socket");
-        close(server_socket);
-        freeaddrinfo(res);
-        return -1;
-    }
-
-    freeaddrinfo(res);
-
-    // If daemon mode is requested, daemonize the process
-    if (daemon_mode) {
-        daemonize();
-    }
-
-    // Start listening for incoming connections
-    if (listen(server_socket, 10) == -1) {
-        perror("Failed to listen on socket");
-        return -1;
-    }
-
-    // Create the timestamp writer thread
-    pthread_t timestamp_thread;
-    pthread_create(&timestamp_thread, NULL, timestamp_writer, NULL);
-
-    // Main loop to accept new connections
-    while (!exit_requested) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
-        if (client_socket == -1) {
-            if (exit_requested) break; // Exit loop if a signal was received
-            perror("Failed to accept connection");
-            continue;
-        }
-
-        // Allocate memory for thread info and add it to the list
-        struct thread_info *tinfo = malloc(sizeof(struct thread_info));
-        tinfo->client_socket = client_socket;
-        SLIST_INSERT_HEAD(&thread_head, tinfo, entries);
-
-        // Create a new thread to handle the connection
-        pthread_create(&tinfo->thread_id, NULL, connection_handler, tinfo);
-    }
-
-    // Join with all remaining threads before exiting
-    struct thread_info *tinfo;
-    while (!SLIST_EMPTY(&thread_head)) {
-        tinfo = SLIST_FIRST(&thread_head);
-        pthread_join(tinfo->thread_id, NULL);
-        SLIST_REMOVE_HEAD(&thread_head, entries);
-        free(tinfo);
-    }
-
-    // Clean up remaining resources
-    close(server_socket);
-    remove(FILE_PATH);
-
-    // Note: The timestamp thread is not explicitly joined here, but the program exits
-    // due to the signal handler's `exit(0)`. This is a slight weakness in the code.
-    // A better approach would be to set a flag and join the thread gracefully.
-    return 0;
+    return EXIT_SUCCESS;
 }
