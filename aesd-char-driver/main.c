@@ -65,10 +65,12 @@ ssize_t aesd_read(
 	loff_t* f_pos
 )
 {
+	size_t pos = *f_pos;
 	ssize_t ret = 0;
-		mutex_lock( &aesd_device.lock );
+	mutex_lock( &aesd_device.lock );
 	PDEBUG("read %zu bytes with offset %lld\n",count,*f_pos);
-		while( true )
+	size_t pos = *f_pos;
+	while( true )
 	{
 		size_t bytes_to_copy;
 		// PDEBUG("pos %ld\n",pos);
