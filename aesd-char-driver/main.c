@@ -69,11 +69,9 @@ ssize_t aesd_read(
 	ssize_t ret = 0;
 	mutex_lock( &aesd_device.lock );
 	PDEBUG("read %zu bytes with offset %lld\n",count,*f_pos);
-	size_t pos = *f_pos;
 	while( true )
 	{
 		size_t bytes_to_copy;
-		// PDEBUG("pos %ld\n",pos);
 		size_t offset = 0;
 		struct aesd_buffer_entry* entry = aesd_circular_buffer_find_entry_offset_for_fpos(
 				&aesd_device.buffer,
@@ -86,17 +84,14 @@ ssize_t aesd_read(
 			goto end;
 		}
 		bytes_to_copy = ((*f_pos)+count) - pos;
-		// PDEBUG("bytes_to_copy: %ld", bytes_to_copy);
 		if( bytes_to_copy == 0 ) {
 			ret = pos - (*f_pos);
 			(*f_pos) += ret;
 			goto end;
 		}
-		// bytes to copy from current entry:
 		if( bytes_to_copy > (entry->size - offset) ) {
 			bytes_to_copy = entry->size - offset;
 		}
-		// PDEBUG("bytes_to_copy: %ld", bytes_to_copy);
 		if( copy_to_user(
 				&buf[pos],
 				&entry->buffptr[offset],
@@ -105,7 +100,6 @@ ssize_t aesd_read(
 			ret = -EFAULT;
 			goto end;
 		}
-		// PDEBUG("appending: '%.*s'", (int )bytes_to_copy, entry->buffptr );
 		pos += bytes_to_copy;
 	}
 
@@ -115,6 +109,7 @@ end:
 	return ret;
 }
 
+
 ssize_t aesd_write(
 		struct file *filp,
 		const char __user *buf,
@@ -122,6 +117,7 @@ ssize_t aesd_write(
 		loff_t *f_pos
 )
 {
+	size_t insert_pos = 0;
 	mutex_lock( &aesd_device.lock );
 		PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
 	if( count == 0 ) {
