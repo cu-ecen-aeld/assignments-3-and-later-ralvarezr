@@ -1,7 +1,7 @@
 #Makefile for assignment 6
 
 CC ?= $(CROSS_COMPILE)gcc
-CFLAGS += -Wall -Werror -Wextra -g
+CFLAGS += -DUSE_AESD_CHAR_DEVICE -I../aesd-char-driver
 LDFLAGS += -lpthread
 
 SRC = aesdsocket.c
